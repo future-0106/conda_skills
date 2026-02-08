@@ -206,7 +206,3 @@ class CondaEnvManager:
         self.root.after(0, lambda: self.refresh_btn.config(state='normal'))
 
 
-# if __name__ == "__main__":
-#     root = tk.Tk()
-#     app = CondaEnvManager(root)
-#     root.mainloop()
