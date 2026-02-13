@@ -60,7 +60,7 @@ class CondaCloneApp:
         """安全执行 conda 命令"""
         try:
             cmd = [self.conda_exe] + args
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=500)
             return result.returncode, result.stdout, result.stderr
         except Exception as e:
             return -1, "", str(e)

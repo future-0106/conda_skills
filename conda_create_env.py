@@ -216,7 +216,7 @@ class CondaEnvCreator:
 
     def _create_env_in_background(self, env_name, python_version):
         try:
-            self.run_conda_cmd(["create", "--name", env_name, f"python={python_version}", "--yes"])
+            self.run_conda_cmd(["create", "--name", env_name, f"python={python_version}","--yes"])
             self.root.after(0, lambda: self.log(f"✅ 环境 '{env_name}' 创建成功！"))
             self.root.after(0, self.load_existing_envs)  # 刷新列表
         except Exception as e:
