@@ -726,10 +726,13 @@ def export_conda_env(env_name=None, output_file="environment.yml", output_md="en
 
 
 # ========================
-# 原有全局配置
+# 全局配置
 # ========================
 app = FastAPI(title="Conda 环境管理 API", version="1.0")
 log_messages = []
+
+# 任务进度管理
+task_progress = {}  # {task_id: {"progress": 0-100, "stage": "阶段描述", "status": "running/completed/failed"}}
 
 
 # 自动定位 conda 路径
@@ -863,12 +866,47 @@ class CreateEnvRequest(BaseModel):
     python_version: str = "3.12"
 
 
-def create_env_background(name: str, python_version: str):
+def create_env_background(name: str, python_version: str, task_id: str = None):
     try:
+        task_progress[task_id] = {"progress": 0, "stage": "正在准备创建环境...", "status": "running"}
         log(f"开始创建环境: {name} (Python {python_version})")
-        run_conda_cmd(["create", "--name", name, f"python={python_version}", "--yes"])
+        
+        task_progress[task_id] = {"progress": 10, "stage": "正在解析依赖...", "status": "running"}
+        
+        # 使用 Popen 实时更新进度
+        import subprocess
+        process = subprocess.Popen(
+            [CONDA_EXE, "create", "--name", name, f"python={python_version}", "--yes"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        stage_progress = 20
+        for line in process.stdout:
+            if "Solving environment" in line:
+                task_progress[task_id] = {"progress": stage_progress, "stage": "正在解析依赖...", "status": "running"}
+            elif "Verifying" in line:
+                stage_progress = 50
+                task_progress[task_id] = {"progress": stage_progress, "stage": "正在验证...", "status": "running"}
+            elif "Downloading" in line or "Extracting" in line:
+                stage_progress = 70
+                task_progress[task_id] = {"progress": stage_progress, "stage": "正在下载/解压包...", "status": "running"}
+            elif "Executing" in line:
+                stage_progress = 85
+                task_progress[task_id] = {"progress": stage_progress, "stage": "正在执行...", "status": "running"}
+        
+        process.wait()
+        
+        if process.returncode != 0:
+            raise Exception("Conda 命令执行失败")
+        
+        task_progress[task_id] = {"progress": 100, "stage": "创建完成", "status": "completed"}
         log(f"✅ 环境 '{name}' 创建成功")
     except Exception as e:
+        task_progress[task_id] = {"progress": 0, "stage": f"创建失败: {str(e)}", "status": "failed"}
         log(f"❌ 创建失败: {str(e)}", error=True)
 
 
@@ -884,8 +922,10 @@ async def create_env(req: CreateEnvRequest, background_tasks: BackgroundTasks):
         if any(env["name"] == req.name for env in envs):
             raise HTTPException(status_code=400, detail=f"环境 '{req.name}' 已存在")
 
-        background_tasks.add_task(create_env_background, req.name, req.python_version)
-        return {"message": f"正在后台创建环境: {req.name}"}
+        import uuid
+        task_id = str(uuid.uuid4())
+        background_tasks.add_task(create_env_background, req.name, req.python_version, task_id)
+        return {"message": f"正在后台创建环境: {req.name}", "task_id": task_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -895,22 +935,37 @@ async def create_env(req: CreateEnvRequest, background_tasks: BackgroundTasks):
 
 # 2. 删除环境
 @app.delete("/envs/{name}")
-async def delete_env(name: str):
+async def delete_env(name: str, background_tasks: BackgroundTasks):
     try:
         # 验证环境存在
         envs = list_all_envs()
         if not any(env["name"] == name for env in envs):
             raise HTTPException(status_code=400, detail=f"环境 '{name}' 不存在")
 
-        log(f"正在删除环境: {name}")
-        run_conda_cmd(["env", "remove", "--name", name, "--yes"])
-        log(f"✅ 环境 '{name}' 删除成功")
-        return {"message": f"环境 '{name}' 已删除"}
+        import uuid
+        task_id = str(uuid.uuid4())
+        background_tasks.add_task(delete_env_background, name, task_id)
+        return {"message": f"正在后台删除环境: {name}", "task_id": task_id}
     except HTTPException:
         raise
     except Exception as e:
         log(str(e), error=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def delete_env_background(name: str, task_id: str):
+    try:
+        task_progress[task_id] = {"progress": 0, "stage": "正在删除环境...", "status": "running"}
+        log(f"正在删除环境: {name}")
+        
+        task_progress[task_id] = {"progress": 30, "stage": "正在移除包...", "status": "running"}
+        run_conda_cmd(["env", "remove", "--name", name, "--yes"])
+        
+        task_progress[task_id] = {"progress": 100, "stage": "删除完成", "status": "completed"}
+        log(f"✅ 环境 '{name}' 删除成功")
+    except Exception as e:
+        task_progress[task_id] = {"progress": 0, "stage": f"删除失败: {str(e)}", "status": "failed"}
+        log(f"❌ 删除失败: {str(e)}", error=True)
 
 
 # 3. 克隆环境
@@ -919,12 +974,38 @@ class CloneEnvRequest(BaseModel):
     new_env: str
 
 
-def clone_env_background(source_env: str, new_env: str):
+def clone_env_background(source_env: str, new_env: str, task_id: str = None):
     try:
+        task_progress[task_id] = {"progress": 0, "stage": "正在准备克隆环境...", "status": "running"}
         log(f"开始克隆环境: {source_env} → {new_env}")
-        run_conda_cmd(["create", "--name", new_env, "--clone", source_env, "--yes"])
+        
+        task_progress[task_id] = {"progress": 10, "stage": "正在复制文件...", "status": "running"}
+        
+        import subprocess
+        process = subprocess.Popen(
+            [CONDA_EXE, "create", "--name", new_env, "--clone", source_env, "--yes"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        stage_progress = 20
+        for line in process.stdout:
+            if "Copying" in line or "Linking" in line:
+                stage_progress = min(80, stage_progress + 5)
+                task_progress[task_id] = {"progress": stage_progress, "stage": "正在复制/链接文件...", "status": "running"}
+        
+        process.wait()
+        
+        if process.returncode != 0:
+            raise Exception("Conda 命令执行失败")
+        
+        task_progress[task_id] = {"progress": 100, "stage": "克隆完成", "status": "completed"}
         log(f"✅ 环境克隆成功: {source_env} → {new_env}")
     except Exception as e:
+        task_progress[task_id] = {"progress": 0, "stage": f"克隆失败: {str(e)}", "status": "failed"}
         log(f"❌ 克隆失败: {str(e)}", error=True)
 
 
@@ -945,8 +1026,10 @@ async def clone_env(req: CloneEnvRequest, background_tasks: BackgroundTasks):
         if req.new_env in env_names:
             raise HTTPException(status_code=400, detail=f"新环境 '{req.new_env}' 已存在")
 
-        background_tasks.add_task(clone_env_background, req.source_env, req.new_env)
-        return {"message": f"正在后台克隆环境: {req.source_env} → {req.new_env}"}
+        import uuid
+        task_id = str(uuid.uuid4())
+        background_tasks.add_task(clone_env_background, req.source_env, req.new_env, task_id)
+        return {"message": f"正在后台克隆环境: {req.source_env} → {req.new_env}", "task_id": task_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -996,6 +1079,14 @@ async def export_env(req: ExportEnvRequest):
     except Exception as e:
         log(str(e), error=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tasks/{task_id}")
+async def get_task_progress(task_id: str):
+    """获取任务进度"""
+    if task_id in task_progress:
+        return task_progress[task_id]
+    return {"progress": 0, "stage": "任务不存在或已完成", "status": "unknown"}
 
 
 @app.get("/logs")
@@ -1051,6 +1142,12 @@ if not os.path.exists(INDEX_FILE):
     .log-entry { margin-bottom: 6px; word-break: break-word; }
     .log-error { color: #ff5555; }
     .log-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .progress-container { margin-bottom: 12px; display: none; }
+    .progress-container.active { display: block; }
+    .progress-bar-wrapper { background: #e9ecef; border-radius: 4px; height: 20px; overflow: hidden; position: relative; }
+    .progress-bar { height: 100%; background: linear-gradient(90deg, #4e73df, #6f8feb); transition: width 0.3s ease; border-radius: 4px; }
+    .progress-text { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 12px; font-weight: 600; color: #333; }
+    .progress-stage { font-size: 12px; color: #666; margin-top: 4px; }
     @media (max-width: 900px) {
       .container { flex-direction: column; }
       .log-sidebar { min-width: auto; align-self: stretch; }
@@ -1139,6 +1236,13 @@ if not os.path.exists(INDEX_FILE):
           <h2>📜 操作日志</h2>
           <button class="btn" style="padding: 4px 10px; font-size: 12px;" onclick="clearLogs()">🗑️ 清空</button>
         </div>
+        <div id="progressContainer" class="progress-container">
+          <div class="progress-bar-wrapper">
+            <div id="progressBar" class="progress-bar" style="width: 0%;"></div>
+            <span id="progressText" class="progress-text">0%</span>
+          </div>
+          <div id="progressStage" class="progress-stage">准备中...</div>
+        </div>
         <div id="logContainer" class="log-container"></div>
       </div>
     </div>
@@ -1217,8 +1321,13 @@ if not os.path.exists(INDEX_FILE):
         }
         const data = await res.json();
         addLog(data.message);
+        
+        // 启动进度跟踪
+        if (data.task_id) {
+          startProgressTracking(data.task_id, '创建环境');
+        }
+        
         document.getElementById('envName').value = '';
-        loadEnvs(); // 刷新列表
       } catch (err) {
         addLog(`❌ 创建失败: ${err.message}`, true);
       }
@@ -1254,8 +1363,13 @@ if not os.path.exists(INDEX_FILE):
         }
         const data = await res.json();
         addLog(data.message);
+        
+        // 启动进度跟踪
+        if (data.task_id) {
+          startProgressTracking(data.task_id, '克隆环境');
+        }
+        
         document.getElementById('newEnvName').value = '';
-        loadEnvs(); // 刷新列表
       } catch (err) {
         addLog(`❌ 克隆失败: ${err.message}`, true);
       }
@@ -1311,10 +1425,66 @@ if not os.path.exists(INDEX_FILE):
         }
         const data = await res.json();
         addLog(data.message);
-        loadEnvs(); // 刷新列表
+        
+        // 启动进度跟踪
+        if (data.task_id) {
+          startProgressTracking(data.task_id, '删除环境');
+        }
       } catch (err) {
         addLog(`❌ 删除失败: ${err.message}`, true);
       }
+    }
+
+    // 进度条相关
+    let currentProgressTaskId = null;
+    let progressPollingInterval = null;
+
+    function startProgressTracking(taskId, taskType) {
+      currentProgressTaskId = taskId;
+      const progressContainer = document.getElementById('progressContainer');
+      const progressBar = document.getElementById('progressBar');
+      const progressText = document.getElementById('progressText');
+      const progressStage = document.getElementById('progressStage');
+      
+      progressContainer.classList.add('active');
+      progressBar.style.width = '0%';
+      progressText.textContent = '0%';
+      progressStage.textContent = `正在${taskType}...`;
+      
+      // 停止之前的轮询
+      if (progressPollingInterval) {
+        clearInterval(progressPollingInterval);
+      }
+      
+      // 开始轮询进度
+      progressPollingInterval = setInterval(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/tasks/${taskId}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          
+          progressBar.style.width = data.progress + '%';
+          progressText.textContent = data.progress + '%';
+          progressStage.textContent = data.stage || '处理中...';
+          
+          // 任务完成或失败
+          if (data.status === 'completed') {
+            clearInterval(progressPollingInterval);
+            progressBar.style.background = 'linear-gradient(90deg, #28a745, #48c764)';
+            setTimeout(() => {
+              progressContainer.classList.remove('active');
+              progressBar.style.background = 'linear-gradient(90deg, #4e73df, #6f8feb)';
+              loadEnvs();
+            }, 2000);
+          } else if (data.status === 'failed') {
+            clearInterval(progressPollingInterval);
+            progressBar.style.background = 'linear-gradient(90deg, #dc3545, #e4606d)';
+            progressStage.textContent = data.stage;
+          }
+        } catch (e) {
+          // 忽略轮询错误
+        }
+      }, 1000);
     }
 
     // 日志相关
